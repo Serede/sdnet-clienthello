@@ -1,0 +1,221 @@
+// Interface subclasses
+class PktIn  :: Packet(in)  {}
+class PktOut :: Packet(out) {}
+class MetadataIn :: Tuple(in) {
+    struct {
+        payload_exists    :  1, // Whether payload is present
+        payload_length    : 32, // Payload length in bits
+        payload_offset    : 32, // Payload offset in bits
+        is_client_hello   :  1  // Whether packet is client hello
+    }
+}
+class MetadataOut :: Tuple(out) {
+    struct {
+        payload_exists    :  1, // Whether payload is present
+        payload_length    : 32, // Payload length in bits
+        payload_offset    : 32, // Payload offset in bits
+        is_client_hello   :  1  // Whether packet is client hello
+    }
+}
+
+class ClientHello :: System {
+
+    PktIn    instream;
+    PktOut   outstream;
+
+    ClientHello_Parser parser;
+    ClientHello_Editor editor;
+
+    method connect = {
+
+        parser.packet_in = instream,
+
+        editor.packet_in = parser.packet_out,
+        editor.tuple_in  = parser.tuple_out,
+
+        outstream = editor.packet_out
+
+    }
+
+} // ClientHello
+
+class ClientHello_Parser :: ParsingEngine(12000, 4, ETH) {
+
+    // Constants
+    // const VLAN_TYPE = 0x8100;
+    const IPV4_TYPE = 0x0800;
+    // const IPV6_TYPE = 0x86dd;
+    const TCP_TYPE = 0x06;
+    // const UDP_TYPE = 0x11;
+    const SUCCESS = 0;
+    const FAILURE = 1;
+
+    MetadataOut tuple_out;
+
+    // Ethernet MAC header
+    class ETH :: Section(1) {
+        struct {
+            skip : 96, // Skip fields
+            type : 16  // Tag Protocol Identifier
+        }
+        // ETH can be followed by VLAN, IPV4 or IPV6
+        map types {
+            // (VLAN_TYPE, VLAN),
+            (IPV4_TYPE, IPV4),
+            // (IPV6_TYPE, IPV6),
+            done(SUCCESS)
+        }
+        // Initialise tuple
+        method update = {
+            tuple_out.payload_exists  = 0,
+            tuple_out.payload_length  = 0,
+            tuple_out.payload_offset  = sizeof(ETH),
+            tuple_out.is_client_hello = 0
+        }
+        // Identify following protocol
+        method move_to_section = types(type);
+        // Move to following protocol
+        method increment_offset = sizeof(ETH);
+    } // ETH
+
+    // VLAN header
+    // class VLAN :: Section(2:3) {
+    //     struct {
+    //         skip : 16, // Skip fields
+    //         tpid : 16  // Tag Protocol Identifier
+    //     }
+    //     // VLAN can be followed by VLAN, IPV4 or IPV6
+    //     map types {
+    //         (VLAN_TYPE, VLAN),
+    //         (IPV4_TYPE, IPV4),
+    //         (IPV6_TYPE, IPV6),
+    //         done(SUCCESS)
+    //     }
+    //     // Update payload offset
+    //     method update = {
+    //         tuple_out.payload_offset = tuple_out.payload_offset + sizeof(VLAN)
+    //     }
+    //     // Identify following protocol
+    //     method move_to_section = types(tpid);
+    //     // Move to following protocol
+    //     method increment_offset = sizeof(VLAN);
+    // } // VLAN
+
+    // IPV4 header
+    class IPV4 :: Section(2) {
+        struct {
+            version : 4,  // Version (4)
+            hdrlen  : 4,  // Header Length
+            tos     : 8,  // Type of Service
+            length  : 16, // Total Length
+            skip    : 40, // Skip fields
+            proto   : 8   // Next Protocol
+        }
+        method update = {
+            // Save payload length
+            tuple_out.payload_length = (8 * length) - (32 * hdrlen),
+            // Update payload offset
+            tuple_out.payload_offset = tuple_out.payload_offset + (32 * hdrlen)
+        }        
+        // IPV4 can be followed by TCP
+        map types {
+            (TCP_TYPE, TCP),
+            // (UDP_TYPE, UDP),
+            done(SUCCESS)
+        }
+        // Identify following protocol
+        method move_to_section = types(proto);
+        // Move to following protocol
+        method increment_offset = hdrlen * 32;
+    } // IPV4
+
+    // IPV6 header
+    // class IPV6 :: Section(2:4) {
+    //     struct {
+    //         skip    : 32, // Skip fields
+    //         length  : 16, // Payload Length
+    //         nexthdr : 8   // Next Header
+    //     }
+    //     // IPV4 can be followed by TCP
+    //     map types {
+    //         (TCP_TYPE, TCP),
+    //         done(SUCCESS)
+    //     }
+    //     method update = {
+    //         // Save payload length
+    //         tuple_out.payload_length = 8 * length,
+    //         // Update payload offset
+    //         tuple_out.payload_offset = tuple_out.payload_offset + 320
+    //     }
+    //     // Identify following protocol
+    //     method move_to_section = types(nexthdr);
+    //     // Move to following protocol
+    //     method increment_offset = 320;
+    // }
+
+    // TCP header
+    class TCP :: Section(3) {
+        struct {
+            skip    : 96, // Skip fields
+            dataoff : 4   // Data Offset
+        }
+        method update = {
+            // Mark payload as present
+            tuple_out.payload_exists = 1,
+            // Update payload length
+            tuple_out.payload_length = tuple_out.payload_length - (32 * dataoff),
+            // Update payload offset
+            tuple_out.payload_offset = tuple_out.payload_offset + (32 * dataoff)
+        }
+        // Identify following protocol
+        method move_to_section =
+            if(tuple_out.payload_length - (32 * dataoff) >= sizeof(SSL_CLIENT_HELLO)) SSL_CLIENT_HELLO
+            else done(SUCCESS);
+        // Move to following protocol
+        method increment_offset = dataoff * 32;
+    } // TCP
+
+    // SSL Client Hello
+    class SSL_CLIENT_HELLO :: Section (4) {
+        struct {
+            rectype : 8,  // Record Content Type
+            skip    : 32, // Skip fields
+            hstype  : 8   // Handshake Type
+        }
+        // Flag as Client Hello
+        method update = {
+            tuple_out.is_client_hello = (rectype == 0x16) && (hstype == 0x01)
+        }
+        // Identify following protocol
+        method move_to_section = done(SUCCESS);
+        // Move to following protocol
+        method increment_offset = 0;
+    } // SSL_CLIENT_HELLO
+
+} // ClientHello_Parser
+
+class ClientHello_Editor :: EditingEngine(12000, 2, FETCH) {
+
+    // Constants
+    const SUCCESS = 0;
+    const FAILURE = 1;
+
+    MetadataIn tuple_in;
+
+    class FETCH :: Section(1) {
+        // Drop only non-ClientHello packets
+        method move_to_section =
+            if (tuple_in.is_client_hello == 0) DROP
+            else done(SUCCESS);
+        method increment_offset = 0;
+    } // FETCH
+
+    class DROP :: Section(2) {
+        // Remove whole packet
+        method remove = rop();
+        // Finish engine
+        method move_to_section = done(SUCCESS);
+        method increment_offset = 0;
+    } // DROP
+
+} // ClientHello_Editor
